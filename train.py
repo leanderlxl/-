@@ -1,0 +1,323 @@
+import os
+import torch
+import torchvision
+from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+from tqdm import tqdm
+import numpy as np
+import argparse
+
+from dataloader import COCOSegDataset, SemanticSegTransform
+
+# 尝试导入torchmetrics，如果失败则使用手动计算
+use_torchmetrics = True
+try:
+    from torchmetrics.classification import MulticlassJaccardIndex
+except ImportError:
+    use_torchmetrics = False
+    print("Warning: torchmetrics not found, using manual mIoU calculation")
+
+# 手动计算mIoU的函数
+def calculate_miou(preds, targets, num_classes):
+    """
+    计算多类IoU的平均值
+    
+    Args:
+        preds: 预测结果，形状为[B, H, W]的long张量
+        targets: 真实标签，形状为[B, H, W]的long张量
+        num_classes: 类别数量
+        
+    Returns:
+        mIoU: 平均IoU值
+    """
+    # 计算每个类别和批次的交集和并集
+    intersection = torch.zeros(num_classes, device=preds.device)
+    union = torch.zeros(num_classes, device=preds.device)
+    
+    for cls in range(num_classes):
+        # 忽略背景类0
+        if cls == 0:
+            continue
+            
+        # 计算当前类别的交集和并集
+        pred_cls = (preds == cls)
+        target_cls = (targets == cls)
+        
+        cls_intersection = (pred_cls & target_cls).sum()
+        cls_union = (pred_cls | target_cls).sum()
+        
+        # 避免除以零
+        if cls_union > 0:
+            intersection[cls] = cls_intersection
+            union[cls] = cls_union
+    
+    # 计算非零类别的IoU
+    valid_classes = (union > 0).sum()
+    if valid_classes == 0:
+        return 0.0
+    
+    iou_per_class = intersection[union > 0] / union[union > 0]
+    mIoU = iou_per_class.mean().item()
+    
+    return mIoU
+
+# 设置随机种子
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# 解析命令行参数
+def parse_args():
+    parser = argparse.ArgumentParser(description='Training script for DeepLabv3 on COCO segmentation')
+    parser.add_argument('--train-img-dir', type=str, default='./train2017', help='Training image directory')
+    parser.add_argument('--train-ann-file', type=str, default='./annotations/instances_train2017.json', help='Training annotation file')
+    parser.add_argument('--val-img-dir', type=str, default='./val2017', help='Validation image directory')
+    parser.add_argument('--val-ann-file', type=str, default='./annotations/instances_val2017.json', help='Validation annotation file')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=25, help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--step-size', type=int, default=7, help='Step size for StepLR scheduler')
+    parser.add_argument('--gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
+    parser.add_argument('--resize-size', type=tuple, default=(256, 256), help='Resize size for images and masks')
+    parser.add_argument('--flip-prob', type=float, default=0.5, help='Probability of horizontal flip')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use')
+    parser.add_argument('--freeze-backbone', action='store_true', help='Freeze backbone and only train classifier')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    return parser.parse_args()
+
+# 主训练函数
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    
+    print(f"Using device: {args.device}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Freeze backbone: {args.freeze_backbone}")
+    
+    # 1. 设置模型
+    print("\n1. Setting up model...")
+    # 加载预训练的 DeepLabv3+ResNet50 模型
+    model = torchvision.models.segmentation.deeplabv3_resnet50(
+        weights=torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
+    )
+    
+    # 替换分类头为 81 类（包括背景）
+    num_classes = 81
+    model.classifier[-1] = nn.Conv2d(
+        in_channels=256,
+        out_channels=num_classes,
+        kernel_size=1
+    )
+    
+    # 冻结 backbone
+    if args.freeze_backbone:
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+    
+    model = model.to(args.device)
+    
+    # 2. 设置数据加载器
+    print("\n2. Setting up data loaders...")
+    
+    # 训练集变换
+    train_transform = SemanticSegTransform(
+        resize_size=args.resize_size,
+        flip_prob=args.flip_prob
+    )
+    
+    # 验证集变换（不需要翻转）
+    val_transform = SemanticSegTransform(
+        resize_size=args.resize_size,
+        flip_prob=0.0
+    )
+    
+    # 加载训练数据集
+    train_dataset = COCOSegDataset(
+        img_dir=args.train_img_dir,
+        ann_file=args.train_ann_file,
+        transform=train_transform
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 加载验证数据集
+    val_dataset = COCOSegDataset(
+        img_dir=args.val_img_dir,
+        ann_file=args.val_ann_file,
+        transform=val_transform
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
+    # 3. 设置损失函数和优化器
+    print("\n3. Setting up loss function and optimizer...")
+    criterion = nn.CrossEntropyLoss()
+    
+    # 只优化需要梯度的参数
+    params_to_optimize = [param for param in model.parameters() if param.requires_grad]
+    optimizer = optim.Adam(
+        params_to_optimize,
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    
+    scheduler = StepLR(
+        optimizer,
+        step_size=args.step_size,
+        gamma=args.gamma
+    )
+    
+    # 4. 设置评估指标 (mIoU)
+    print("\n4. Setting up evaluation metrics...")
+    iou_metric = None
+    if use_torchmetrics:
+        iou_metric = MulticlassJaccardIndex(num_classes=num_classes, average='macro').to(args.device)
+    
+    # 5. 训练循环
+    print("\n5. Starting training loop...")
+    best_iou = 0.0
+    
+    for epoch in range(args.epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        train_iou = 0.0
+        
+        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Training") as pbar:
+            for images, masks in pbar:
+                images = images.to(args.device)
+                masks = masks.to(args.device)
+                
+                # 前向传播
+                outputs = model(images)
+                out = outputs['out']
+                
+                # 计算损失
+                loss = criterion(out, masks)
+                
+                # 梯度更新
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # 计算 IoU
+                with torch.no_grad():
+                    predicted = out.argmax(dim=1)
+                    if use_torchmetrics and iou_metric is not None:
+                        batch_iou = iou_metric(predicted, masks)
+                    else:
+                        batch_iou = calculate_miou(predicted, masks, num_classes)
+                    
+                # 更新统计信息
+                train_loss += loss.item() * images.size(0)
+                train_iou += batch_iou * images.size(0)
+                
+                # 格式化IoU值，根据类型决定是否调用.item()
+                iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
+                
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'iou': f'{iou_value:.4f}'
+                })
+        
+        # 计算 epoch 训练指标
+        train_loss /= len(train_dataset)
+        train_iou /= len(train_dataset)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        val_iou = 0.0
+        
+        with torch.no_grad():
+            with tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Validation") as pbar:
+                for images, masks in pbar:
+                    images = images.to(args.device)
+                    masks = masks.to(args.device)
+                    
+                    # 前向传播
+                    outputs = model(images)
+                    out = outputs['out']
+                    
+                    # 计算损失
+                    loss = criterion(out, masks)
+                    
+                    # 计算 IoU
+                    predicted = out.argmax(dim=1)
+                    if use_torchmetrics and iou_metric is not None:
+                        batch_iou = iou_metric(predicted, masks)
+                    else:
+                        batch_iou = calculate_miou(predicted, masks, num_classes)
+                    
+                    # 更新统计信息
+                    val_loss += loss.item() * images.size(0)
+                    val_iou += batch_iou * images.size(0)
+                    
+                    # 格式化IoU值，根据类型决定是否调用.item()
+                    iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
+                    
+                    pbar.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'iou': f'{iou_value:.4f}'
+                    })
+        
+        # 计算 epoch 验证指标
+        val_loss /= len(val_dataset)
+        val_iou /= len(val_dataset)
+        
+        # 更新学习率
+        scheduler.step()
+        
+        # 保存最佳模型
+        if val_iou > best_iou:
+            best_iou = val_iou
+            os.makedirs('./checkpoints', exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_iou': best_iou,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_iou': train_iou,
+                'val_iou': val_iou
+            }, './checkpoints/best_model.pth')
+            print(f"New best model saved with IoU: {best_iou:.4f}")
+        
+        # 打印 epoch 结果
+        print(f"Epoch {epoch+1}/{args.epochs}:")
+        print(f"  Train Loss: {train_loss:.4f}, Train IoU: {train_iou:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Val IoU: {val_iou:.4f}")
+        print(f"  Best Val IoU: {best_iou:.4f}")
+        print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        print()
+    
+    print("\nTraining completed!")
+    print(f"Best validation IoU: {best_iou:.4f}")
+
+if __name__ == '__main__':
+    main()
