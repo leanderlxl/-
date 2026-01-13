@@ -135,114 +135,121 @@ class COCOSegDataset(Dataset):
     def __len__(self) -> int:
         return len(self.img_ids)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 获取图像ID
-        img_id = self.img_ids[idx]
-        
-        # 加载图像信息
-        img_info = self.coco.loadImgs(img_id)[0]
-        img_path = os.path.join(self.img_dir, img_info['file_name'])
-        
-        # 检查图像是否存在
-        if not os.path.exists(img_path):
-            raise FileNotFoundError(f"Image not found: {img_path}")
-        
-        # 读取原图
-        image = Image.open(img_path).convert('RGB')
-        h, w = img_info['height'], img_info['width']
-        
-        # 验证图像尺寸是否与注释一致
-        if image.height != h or image.width != w:
-            raise ValueError(f"Image size mismatch for image {img_id}: expected {w}x{h}, got {image.width}x{image.height}")
-        
-        # 创建空的语义分割掩码（背景=0）
-        seg_mask = np.zeros((h, w), dtype=np.int64)  # 使用int64确保类别ID范围足够
-        
-        # 加载该图像的所有注释
-        ann_ids = self.coco.getAnnIds(imgIds=img_id)
-        anns = self.coco.loadAnns(ann_ids)
-        
-        # 遍历所有注释，生成掩码
-        for ann in anns:
-            try:
-                cat_id = ann['category_id']
-                if cat_id in self.cat_id_to_cont_id:
-                    cont_id = self.cat_id_to_cont_id[cat_id]
-                    # 确保类别ID在有效范围内 (0~80)
-                    if cont_id > 80:
-                        print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
-                        cont_id = min(cont_id, 80)
-                    # 使用COCO API获取二值掩码
-                    binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
+    def __getitem__(self, idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        try:
+            # 获取图像ID
+            img_id = self.img_ids[idx]
+            
+            # 加载图像信息
+            img_info = self.coco.loadImgs(img_id)[0]
+            img_path = os.path.join(self.img_dir, img_info['file_name'])
+            
+            # 检查图像是否存在
+            if not os.path.exists(img_path):
+                print(f"Warning: Image not found: {img_path}")
+                return None
+            
+            # 读取原图
+            image = Image.open(img_path).convert('RGB')
+            h, w = img_info['height'], img_info['width']
+            
+            # 验证图像尺寸是否与注释一致
+            if image.height != h or image.width != w:
+                print(f"Warning: Image size mismatch for image {img_id}: expected {w}x{h}, got {image.width}x{image.height}")
+                return None
+            
+            # 创建空的语义分割掩码（背景=0）
+            seg_mask = np.zeros((h, w), dtype=np.int64)  # 使用int64确保类别ID范围足够
+            
+            # 加载该图像的所有注释
+            ann_ids = self.coco.getAnnIds(imgIds=img_id)
+            anns = self.coco.loadAnns(ann_ids)
+            
+            # 遍历所有注释，生成掩码
+            for ann in anns:
+                try:
+                    cat_id = ann['category_id']
+                    if cat_id in self.cat_id_to_cont_id:
+                        cont_id = self.cat_id_to_cont_id[cat_id]
+                        # 确保类别ID在有效范围内 (0~80)
+                        if cont_id > 80:
+                            print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
+                            cont_id = min(cont_id, 80)
+                        # 使用COCO API获取二值掩码
+                        binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
+                        
+                        # 验证掩码尺寸是否与图像一致
+                        if binary_mask.shape != (h, w):
+                            binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                        
+                        # 按连续类别ID填充掩码
+                        seg_mask[binary_mask == 1] = cont_id
+                except Exception as e:
+                    print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
+                    continue
+            
+            # 转换为PIL Image以便应用transform
+            seg_mask_img = Image.fromarray(seg_mask.astype(np.int32))  # PIL需要int32格式
+            
+            # 应用transform
+            image_tensor = None
+            mask_tensor = None
+            
+            if self.transform is not None:
+                try:
+                    # 同时对图像和掩码应用transform
+                    transformed = self.transform(image, seg_mask_img)
                     
-                    # 验证掩码尺寸是否与图像一致
-                    if binary_mask.shape != (h, w):
-                        binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                    
-                    # 按连续类别ID填充掩码
-                    seg_mask[binary_mask == 1] = cont_id
-            except Exception as e:
-                print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
-                continue
-        
-        # 转换为PIL Image以便应用transform
-        seg_mask_img = Image.fromarray(seg_mask.astype(np.int32))  # PIL需要int32格式
-        
-        # 应用transform
-        image_tensor = None
-        mask_tensor = None
-        
-        if self.transform is not None:
-            try:
-                # 同时对图像和掩码应用transform
-                transformed = self.transform(image, seg_mask_img)
-                
-                # 检查transform的返回值
-                if isinstance(transformed, tuple) and len(transformed) == 2:
-                    image_result, mask_result = transformed
-                    
-                    # 确保图像是张量格式
-                    if isinstance(image_result, torch.Tensor):
-                        image_tensor = image_result
+                    # 检查transform的返回值
+                    if isinstance(transformed, tuple) and len(transformed) == 2:
+                        image_result, mask_result = transformed
+                        
+                        # 确保图像是张量格式
+                        if isinstance(image_result, torch.Tensor):
+                            image_tensor = image_result
+                        else:
+                            # 使用ToTensor转换图像并归一化
+                            image_tensor = transforms.ToTensor()(image_result)
+                            image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
+                        
+                        # 确保掩码是numpy数组或PIL Image，然后转换为torch.long
+                        if isinstance(mask_result, torch.Tensor):
+                            mask_tensor = mask_result.long()
+                        else:
+                            mask_np = np.array(mask_result, dtype=np.int64)
+                            mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
                     else:
-                        # 使用ToTensor转换图像并归一化
-                        image_tensor = transforms.ToTensor()(image_result)
-                        image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
-                    
-                    # 确保掩码是numpy数组或PIL Image，然后转换为torch.long
-                    if isinstance(mask_result, torch.Tensor):
-                        mask_tensor = mask_result.long()
-                    else:
-                        mask_np = np.array(mask_result, dtype=np.int64)
-                        mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
-                else:
-                    raise ValueError("transform should return a tuple of (image, mask)")
-            except Exception as e:
-                print(f"Error applying transform to image {img_id}: {e}")
+                        print(f"Warning: Transform should return a tuple of (image, mask), got {type(transformed)}")
+                        return None
+                except Exception as e:
+                    print(f"Error applying transform to image {img_id}: {e}")
+                    # 应用默认变换
+                    image_tensor = transforms.ToTensor()(image)
+                    image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
+                    mask_tensor = torch.as_tensor(seg_mask, dtype=torch.long)
+            else:
                 # 应用默认变换
                 image_tensor = transforms.ToTensor()(image)
                 image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
                 mask_tensor = torch.as_tensor(seg_mask, dtype=torch.long)
-        else:
-            # 应用默认变换
-            image_tensor = transforms.ToTensor()(image)
-            image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
-            mask_tensor = torch.as_tensor(seg_mask, dtype=torch.long)
-        
-        # 确保掩码是2D张量（HxW）
-        if len(mask_tensor.shape) > 2:
-            mask_tensor = mask_tensor.squeeze(0)
-        
-        # 验证图像和掩码尺寸一致
-        if image_tensor.shape[1:] != mask_tensor.shape:
-            print(f"Warning: Image and mask size mismatch for image {img_id}: image {image_tensor.shape[1:]}, mask {mask_tensor.shape}")
-            # 调整掩码尺寸以匹配图像
-            new_h, new_w = image_tensor.shape[1], image_tensor.shape[2]
-            mask_np = mask_tensor.numpy()
-            mask_np = cv2.resize(mask_np.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-            mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
-        
-        return image_tensor, mask_tensor
+            
+            # 确保掩码是2D张量（HxW）
+            if len(mask_tensor.shape) > 2:
+                mask_tensor = mask_tensor.squeeze(0)
+            
+            # 验证图像和掩码尺寸一致
+            if image_tensor.shape[1:] != mask_tensor.shape:
+                print(f"Warning: Image and mask size mismatch for image {img_id}: image {image_tensor.shape[1:]}, mask {mask_tensor.shape}")
+                # 调整掩码尺寸以匹配图像
+                new_h, new_w = image_tensor.shape[1], image_tensor.shape[2]
+                mask_np = mask_tensor.numpy()
+                mask_np = cv2.resize(mask_np.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
+            
+            return image_tensor, mask_tensor
+        except Exception as e:
+            print(f"Warning: Error in __getitem__ for index {idx}: {e}")
+            return None
 
 
 class COCO_SemanticSegDataset(Dataset):
@@ -301,7 +308,7 @@ class COCO_SemanticSegDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_ids)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         try:
             img_id = self.image_ids[idx]
             # 动态获取数据集前缀，避免硬编码
@@ -316,7 +323,8 @@ class COCO_SemanticSegDataset(Dataset):
             image_path = os.path.join(self.root_dir, f'{prefix}_{img_id:012d}.jpg')
 
             if not os.path.exists(image_path):
-                raise FileNotFoundError(f"Image not found: {image_path}")
+                print(f"Warning: Image not found: {image_path}")
+                return None
 
             # 读取图像
             image = Image.open(image_path).convert("RGB")
@@ -411,7 +419,8 @@ class COCO_SemanticSegDataset(Dataset):
                             mask_np = np.array(mask_result, dtype=np.int64)
                             mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
                     else:
-                        raise ValueError("transform should return a tuple of (image, mask)")
+                        print(f"Warning: Transform should return a tuple of (image, mask), got {type(transformed)}")
+                        return None
                 else:
                     # 只对图像应用变换
                     if isinstance(image, torch.Tensor):
@@ -433,7 +442,11 @@ class COCO_SemanticSegDataset(Dataset):
                 if hasattr(self.target_transform, '__name__') and self.target_transform.__name__ == 'ToTensor':
                     print(f"Warning: target_transform should not be ToTensor() for mask, skipping transform for image {img_id}")
                 else:
-                    mask_tensor = self.target_transform(mask_tensor)
+                    try:
+                        mask_tensor = self.target_transform(mask_tensor)
+                    except Exception as e:
+                        print(f"Warning: Error applying target_transform to image {img_id}: {e}")
+                        return None
 
             # 确保掩码是2D张量（HxW）
             if len(mask_tensor.shape) > 2:
@@ -450,9 +463,8 @@ class COCO_SemanticSegDataset(Dataset):
 
             return image_tensor, mask_tensor
         except Exception as e:
-            print(f"Error in processing image {img_id}: {e}")
-            # 返回第一个图像作为替代
-            return self.__getitem__(0)
+            print(f"Warning: Error in __getitem__ for index {idx}: {e}")
+            return None
 
     def _decode_rle(self, rle: Any, height: int, width: int) -> np.ndarray:
         """
