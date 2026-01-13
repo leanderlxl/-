@@ -348,8 +348,8 @@ def main() -> None:
                     else:
                         batch_iou = calculate_miou(predicted, masks, num_classes)
                     
-                    # 可视化第一个epoch的预测结果
-                    if epoch == 0 and val_batches == 0:  # 只在第一个epoch的第一个batch可视化
+                    # 可视化预测结果，每隔2个epoch记录一次
+                    if val_batches == 0 and (epoch % 2 == 0):  # 每个epoch的第一个batch，每隔2个epoch记录一次
                         # 选择第一张图片进行可视化
                         
                         # 恢复图像的原始颜色
@@ -382,6 +382,7 @@ def main() -> None:
                         
                         # 将图像写入TensorBoard
                         writer.add_figure('Val/Prediction_Example', fig, epoch)
+                        plt.close(fig)  # 显式关闭figure，释放内存
                     
                     # 递增batch计数
                     val_batches += 1
@@ -411,6 +412,13 @@ def main() -> None:
         writer.add_scalar('Loss/Val', val_loss, epoch)
         writer.add_scalar('mIoU/Train', train_iou, epoch)
         writer.add_scalar('mIoU/Val', val_iou, epoch)
+        
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Params/Learning_Rate', current_lr, epoch)
+        
+        # 强制刷新到硬盘，防止程序崩溃导致数据丢失
+        writer.flush()
         
         # 更新学习率
         if args.scheduler == 'plateau':
