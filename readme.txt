@@ -5,5 +5,6 @@ python train.py \
   --val-ann-file /root/autodl-tmp/annotations/instances_val2014.json \
   --batch-size 4 \
   --epochs 1 \
-  --lr 1e-5 \
+  --lr 1e-3 \
   --device cuda
+明天早上起来再继续训练5轮

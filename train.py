@@ -243,25 +243,54 @@ def main() -> None:
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
     
-    # 4. 设置评估指标 (mIoU)
-    print("\n4. Setting up evaluation metrics...")
+    # 4. 加载checkpoint（如果存在）
+    print("\n4. Checking for checkpoint...")
+    start_epoch = 0
+    best_iou = 0.0
+    checkpoint_path = './checkpoints/best_model.pth'
+    
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=args.device)
+        
+        # 加载模型状态
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 加载优化器状态
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 加载调度器状态
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 加载训练统计信息
+        start_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
+        best_iou = checkpoint['best_iou']
+        
+        print(f"Checkpoint loaded successfully.")
+        print(f"  Starting from epoch: {start_epoch}")
+        print(f"  Best IoU so far: {best_iou:.4f}")
+    else:
+        print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+    
+    # 5. 设置评估指标 (mIoU)
+    print("\n5. Setting up evaluation metrics...")
     iou_metric = None
     if use_torchmetrics:
         iou_metric = MulticlassJaccardIndex(num_classes=num_classes, average='macro').to(args.device)
     
-    # 5. 初始化TensorBoard
-    print("\n5. Setting up TensorBoard...")
+    # 6. 初始化TensorBoard
+    print("\n6. Setting up TensorBoard...")
     tensorboard_dir = '/root/tf-logs'
     os.makedirs(tensorboard_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tensorboard_dir)
     
-    # 6. 训练循环
-    print("\n6. Starting training loop...")
-    best_iou = 0.0
+    # 7. 训练循环
+    print("\n7. Starting training loop...")
     early_stopping_patience = 5  # 设置早停耐心值
     epochs_without_improvement = 0  # 跟踪没有改进的轮数
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # 训练阶段
         model.train()
         train_loss = 0.0
