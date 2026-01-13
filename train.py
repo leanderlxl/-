@@ -251,11 +251,15 @@ def main() -> None:
     
     # 5. 初始化TensorBoard
     print("\n5. Setting up TensorBoard...")
-    writer = SummaryWriter(log_dir='runs/coco_seg_exp1')
+    tensorboard_dir = '/root/tf-logs'
+    os.makedirs(tensorboard_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tensorboard_dir)
     
     # 6. 训练循环
     print("\n6. Starting training loop...")
     best_iou = 0.0
+    early_stopping_patience = 5  # 设置早停耐心值
+    epochs_without_improvement = 0  # 跟踪没有改进的轮数
     
     for epoch in range(args.epochs):
         # 训练阶段
@@ -398,7 +402,7 @@ def main() -> None:
         if val_batches > 0:
             val_loss /= val_batches
             val_iou /= val_batches
-        else:
+        else: 
             val_loss = 0.0
             val_iou = 0.0
         
@@ -430,6 +434,17 @@ def main() -> None:
                 'val_iou': val_iou
             }, './checkpoints/best_model.pth')
             print(f"New best model saved with IoU: {best_iou:.4f}")
+            # 重置没有改进的轮数
+            epochs_without_improvement = 0
+        else:
+            # 没有改进，增加计数
+            epochs_without_improvement += 1
+            print(f"No improvement for {epochs_without_improvement} epoch(s)")
+        
+        # 检查早停条件
+        if epochs_without_improvement >= early_stopping_patience:
+            print(f"Early stopping triggered after {epoch+1} epochs without improvement")
+            break
         
         # 打印 epoch 结果
         print(f"Epoch {epoch+1}/{args.epochs}:")
