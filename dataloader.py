@@ -26,11 +26,21 @@ class SemanticSegTransform:
     Args:
         resize_size (tuple, optional): 调整大小尺寸 (h, w)
         flip_prob (float, optional): 水平翻转概率
+        crop_prob (float, optional): 随机裁剪概率
+        crop_size (tuple, optional): 随机裁剪尺寸 (h, w)
+        color_jitter (dict, optional): 颜色增强参数 {brightness, contrast, saturation, hue}
         normalize (dict, optional): 归一化参数 {mean: [...], std: [...]}，默认为 ImageNet 归一化
     """
-    def __init__(self, resize_size=None, flip_prob=0.5, normalize=None):
+    def __init__(self, resize_size=None, flip_prob=0.5, crop_prob=0.5, crop_size=None, color_jitter=None, normalize=None):
         self.resize_size = resize_size
         self.flip_prob = flip_prob
+        self.crop_prob = crop_prob
+        self.crop_size = crop_size
+        
+        # 设置颜色增强
+        if color_jitter is None:
+            color_jitter = {'brightness': 0.2, 'contrast': 0.2, 'saturation': 0.2, 'hue': 0.1}
+        self.color_jitter = color_jitter
         
         # 默认使用 ImageNet 归一化
         if normalize is None:
@@ -44,7 +54,7 @@ class SemanticSegTransform:
         if not isinstance(mask, Image.Image):
             mask = Image.fromarray(mask)
         
-        # 调整大小
+        # 调整大小（如果需要）
         if self.resize_size is not None:
             # 对图像使用双线性插值
             image = image.resize(self.resize_size[::-1], Image.BILINEAR)
@@ -55,6 +65,21 @@ class SemanticSegTransform:
         if np.random.rand() < self.flip_prob:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # 随机裁剪
+        if self.crop_size is not None and np.random.rand() < self.crop_prob:
+            i, j, h, w = transforms.RandomCrop.get_params(image, output_size=self.crop_size)
+            image = transforms.functional.crop(image, i, j, h, w)
+            mask = transforms.functional.crop(mask, i, j, h, w)
+        
+        # 颜色增强
+        if self.color_jitter is not None:
+            image = transforms.ColorJitter(
+                brightness=self.color_jitter['brightness'],
+                contrast=self.color_jitter['contrast'],
+                saturation=self.color_jitter['saturation'],
+                hue=self.color_jitter['hue']
+            )(image)
         
         # 转换为张量
         image = transforms.ToTensor()(image)
@@ -111,60 +136,54 @@ class COCOSegDataset(Dataset):
         return len(self.img_ids)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        try:
-            # 获取图像ID
-            img_id = self.img_ids[idx]
-            
-            # 加载图像信息
-            img_info = self.coco.loadImgs(img_id)[0]
-            img_path = os.path.join(self.img_dir, img_info['file_name'])
-            
-            # 检查图像是否存在
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"Image not found: {img_path}")
-            
-            # 读取原图
-            image = Image.open(img_path).convert('RGB')
-            h, w = img_info['height'], img_info['width']
-            
-            # 验证图像尺寸是否与注释一致
-            if image.height != h or image.width != w:
-                raise ValueError(f"Image size mismatch for image {img_id}: expected {w}x{h}, got {image.width}x{image.height}")
-            
-            # 创建空的语义分割掩码（背景=0）
-            seg_mask = np.zeros((h, w), dtype=np.int64)  # 使用int64确保类别ID范围足够
-            
-            # 加载该图像的所有注释
-            ann_ids = self.coco.getAnnIds(imgIds=img_id)
-            anns = self.coco.loadAnns(ann_ids)
-            
-            # 遍历所有注释，生成掩码
-            for ann in anns:
-                try:
-                    cat_id = ann['category_id']
-                    if cat_id in self.cat_id_to_cont_id:
-                        cont_id = self.cat_id_to_cont_id[cat_id]
-                        # 确保类别ID在有效范围内 (0~80)
-                        if cont_id > 80:
-                            print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
-                            cont_id = min(cont_id, 80)
-                        # 使用COCO API获取二值掩码
-                        binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
-                        
-                        # 验证掩码尺寸是否与图像一致
-                        if binary_mask.shape != (h, w):
-                            binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # 按连续类别ID填充掩码
-                        seg_mask[binary_mask == 1] = cont_id
-                except Exception as e:
-                    print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
-                    continue
+        # 获取图像ID
+        img_id = self.img_ids[idx]
         
-        except Exception as e:
-            print(f"Error in processing image {img_id}: {e}")
-            # 返回第一个图像作为替代
-            return self.__getitem__(0)
+        # 加载图像信息
+        img_info = self.coco.loadImgs(img_id)[0]
+        img_path = os.path.join(self.img_dir, img_info['file_name'])
+        
+        # 检查图像是否存在
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Image not found: {img_path}")
+        
+        # 读取原图
+        image = Image.open(img_path).convert('RGB')
+        h, w = img_info['height'], img_info['width']
+        
+        # 验证图像尺寸是否与注释一致
+        if image.height != h or image.width != w:
+            raise ValueError(f"Image size mismatch for image {img_id}: expected {w}x{h}, got {image.width}x{image.height}")
+        
+        # 创建空的语义分割掩码（背景=0）
+        seg_mask = np.zeros((h, w), dtype=np.int64)  # 使用int64确保类别ID范围足够
+        
+        # 加载该图像的所有注释
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        
+        # 遍历所有注释，生成掩码
+        for ann in anns:
+            try:
+                cat_id = ann['category_id']
+                if cat_id in self.cat_id_to_cont_id:
+                    cont_id = self.cat_id_to_cont_id[cat_id]
+                    # 确保类别ID在有效范围内 (0~80)
+                    if cont_id > 80:
+                        print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
+                        cont_id = min(cont_id, 80)
+                    # 使用COCO API获取二值掩码
+                    binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
+                    
+                    # 验证掩码尺寸是否与图像一致
+                    if binary_mask.shape != (h, w):
+                        binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    
+                    # 按连续类别ID填充掩码
+                    seg_mask[binary_mask == 1] = cont_id
+            except Exception as e:
+                print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
+                continue
         
         # 转换为PIL Image以便应用transform
         seg_mask_img = Image.fromarray(seg_mask.astype(np.int32))  # PIL需要int32格式

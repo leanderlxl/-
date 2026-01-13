@@ -1,13 +1,17 @@
 import os
 import torch
 import torchvision
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR, ReduceLROnPlateau
+from torch.utils.tensorboard import SummaryWriter
+from typing import Union, Tuple, Optional
 from tqdm import tqdm
 import numpy as np
 import argparse
+import matplotlib.pyplot as plt
 
 from dataloader import COCOSegDataset, SemanticSegTransform
 
@@ -20,7 +24,7 @@ except ImportError:
     print("Warning: torchmetrics not found, using manual mIoU calculation")
 
 # 手动计算mIoU的函数
-def calculate_miou(preds, targets, num_classes):
+def calculate_miou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> float:
     """
     计算多类IoU的平均值
     
@@ -32,7 +36,7 @@ def calculate_miou(preds, targets, num_classes):
     Returns:
         mIoU: 平均IoU值
     """
-    # 计算每个类别和批次的交集和并集
+    # 计算每个类别和批次的交集和并集    
     intersection = torch.zeros(num_classes, device=preds.device)
     union = torch.zeros(num_classes, device=preds.device)
     
@@ -64,7 +68,7 @@ def calculate_miou(preds, targets, num_classes):
     return mIoU
 
 # 设置随机种子
-def set_seed(seed):
+def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
@@ -72,16 +76,17 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 # 解析命令行参数
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Training script for DeepLabv3 on COCO segmentation')
     parser.add_argument('--train-img-dir', type=str, default='./train2017', help='Training image directory')
     parser.add_argument('--train-ann-file', type=str, default='./annotations/instances_train2017.json', help='Training annotation file')
-    parser.add_argument('--val-img-dir', type=str, default='./val2017', help='Validation image directory')
-    parser.add_argument('--val-ann-file', type=str, default='./annotations/instances_val2017.json', help='Validation annotation file')
+    parser.add_argument('--val-img-dir', type=str, default='./val2014', help='Validation image directory')
+    parser.add_argument('--val-ann-file', type=str, default='./annotations/instances_val2014.json', help='Validation annotation file')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--epochs', type=int, default=25, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--scheduler', type=str, default='steplr', choices=['steplr', 'cosine', 'plateau'], help='Scheduler type')
     parser.add_argument('--step-size', type=int, default=7, help='Step size for StepLR scheduler')
     parser.add_argument('--gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
     parser.add_argument('--resize-size', type=tuple, default=(256, 256), help='Resize size for images and masks')
@@ -92,7 +97,7 @@ def parse_args():
     return parser.parse_args()
 
 # 主训练函数
-def main():
+def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     
@@ -146,14 +151,6 @@ def main():
         transform=train_transform
     )
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    
     # 加载验证数据集
     val_dataset = COCOSegDataset(
         img_dir=args.val_img_dir,
@@ -161,12 +158,51 @@ def main():
         transform=val_transform
     )
     
+    # 随机采样1000张验证集（固定seed确保可复现）
+    val_indices = np.random.choice(len(val_dataset), 1000, replace=False)
+    val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+    
+    # 自定义collate_fn，跳过错误图像
+    def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 过滤掉None值（错误图像）
+        batch = list(filter(lambda x: x is not None, batch))
+        if len(batch) == 0:
+            # 如果当前批次所有图像都出错，返回空批次
+            return torch.Tensor(), torch.Tensor()
+        # 使用默认的collate_fn处理过滤后的批次
+        return torch.utils.data.dataloader.default_collate(batch)
+    
+    # 自定义Dataset包装器，用于处理异常
+    class SafeDataset(torch.utils.data.Dataset):
+        def __init__(self, dataset):
+            self.dataset = dataset
+        
+        def __getitem__(self, idx: int) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+            try:
+                return self.dataset[idx]
+            except Exception as e:
+                print(f"Error loading sample {idx}: {e}")
+                return None
+        
+        def __len__(self) -> int:
+            return len(self.dataset)
+    
+    train_loader = DataLoader(
+        SafeDataset(train_dataset),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
     val_loader = DataLoader(
-        val_dataset,
+        SafeDataset(val_dataset),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
     
     print(f"Training dataset size: {len(train_dataset)}")
@@ -184,11 +220,28 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    scheduler = StepLR(
-        optimizer,
-        step_size=args.step_size,
-        gamma=args.gamma
-    )
+    # 根据选择创建不同的调度器
+    if args.scheduler == 'steplr':
+        scheduler = StepLR(
+            optimizer,
+            step_size=args.step_size,
+            gamma=args.gamma
+        )
+    elif args.scheduler == 'cosine':
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs
+        )
+    elif args.scheduler == 'plateau':
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='max',  # 最大化mIoU
+            factor=args.gamma,
+            patience=3,
+            verbose=True
+        )
+    else:
+        raise ValueError(f"Unknown scheduler type: {args.scheduler}")
     
     # 4. 设置评估指标 (mIoU)
     print("\n4. Setting up evaluation metrics...")
@@ -196,8 +249,12 @@ def main():
     if use_torchmetrics:
         iou_metric = MulticlassJaccardIndex(num_classes=num_classes, average='macro').to(args.device)
     
-    # 5. 训练循环
-    print("\n5. Starting training loop...")
+    # 5. 初始化TensorBoard
+    print("\n5. Setting up TensorBoard...")
+    writer = SummaryWriter(log_dir='runs/coco_seg_exp1')
+    
+    # 6. 训练循环
+    print("\n6. Starting training loop...")
     best_iou = 0.0
     
     for epoch in range(args.epochs):
@@ -205,9 +262,14 @@ def main():
         model.train()
         train_loss = 0.0
         train_iou = 0.0
+        train_batches = 0
         
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Training") as pbar:
             for images, masks in pbar:
+                # 跳过空批次
+                if images.size(0) == 0:
+                    continue
+                    
                 images = images.to(args.device)
                 masks = masks.to(args.device)
                 
@@ -231,9 +293,10 @@ def main():
                     else:
                         batch_iou = calculate_miou(predicted, masks, num_classes)
                     
-                # 更新统计信息
-                train_loss += loss.item() * images.size(0)
-                train_iou += batch_iou * images.size(0)
+                # 更新统计信息（使用batch平均）
+                train_loss += loss.item()
+                train_iou += batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
+                train_batches += 1
                 
                 # 格式化IoU值，根据类型决定是否调用.item()
                 iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
@@ -244,17 +307,26 @@ def main():
                 })
         
         # 计算 epoch 训练指标
-        train_loss /= len(train_dataset)
-        train_iou /= len(train_dataset)
+        if train_batches > 0:
+            train_loss /= train_batches
+            train_iou /= train_batches
+        else:
+            train_loss = 0.0
+            train_iou = 0.0
         
         # 验证阶段
         model.eval()
         val_loss = 0.0
         val_iou = 0.0
+        val_batches = 0
         
         with torch.no_grad():
             with tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Validation") as pbar:
                 for images, masks in pbar:
+                    # 跳过空批次
+                    if images.size(0) == 0:
+                        continue
+                    
                     images = images.to(args.device)
                     masks = masks.to(args.device)
                     
@@ -272,9 +344,47 @@ def main():
                     else:
                         batch_iou = calculate_miou(predicted, masks, num_classes)
                     
-                    # 更新统计信息
-                    val_loss += loss.item() * images.size(0)
-                    val_iou += batch_iou * images.size(0)
+                    # 可视化第一个epoch的预测结果
+                    if epoch == 0 and val_batches == 0:  # 只在第一个epoch的第一个batch可视化
+                        # 选择第一张图片进行可视化
+                        
+                        # 恢复图像的原始颜色
+                        inv_normalize = transforms.Compose([
+                            transforms.Normalize(mean=[0., 0., 0.], std=[1/0.229, 1/0.224, 1/0.225]),
+                            transforms.Normalize(mean=[-0.485, -0.456, -0.406], std=[1., 1., 1.])
+                        ])
+                        
+                        img = inv_normalize(images[0]).cpu().numpy().transpose(1, 2, 0)
+                        img = np.clip(img, 0, 1)
+                        
+                        mask = masks[0].cpu().numpy()
+                        pred = predicted[0].cpu().numpy()
+                        
+                        # 创建可视化图像
+                        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                        axs[0].imshow(img)
+                        axs[0].set_title('Image')
+                        axs[0].axis('off')
+                        
+                        axs[1].imshow(mask, cmap='jet')
+                        axs[1].set_title('Ground Truth')
+                        axs[1].axis('off')
+                        
+                        axs[2].imshow(pred, cmap='jet')
+                        axs[2].set_title('Prediction')
+                        axs[2].axis('off')
+                        
+                        plt.tight_layout()
+                        
+                        # 将图像写入TensorBoard
+                        writer.add_figure('Val/Prediction_Example', fig, epoch)
+                    
+                    # 递增batch计数
+                    val_batches += 1
+                    
+                    # 更新统计信息（使用batch平均）
+                    val_loss += loss.item()
+                    val_iou += batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
                     
                     # 格式化IoU值，根据类型决定是否调用.item()
                     iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
@@ -285,11 +395,24 @@ def main():
                     })
         
         # 计算 epoch 验证指标
-        val_loss /= len(val_dataset)
-        val_iou /= len(val_dataset)
+        if val_batches > 0:
+            val_loss /= val_batches
+            val_iou /= val_batches
+        else:
+            val_loss = 0.0
+            val_iou = 0.0
+        
+        # 记录到TensorBoard
+        writer.add_scalar('Loss/Train', train_loss, epoch)
+        writer.add_scalar('Loss/Val', val_loss, epoch)
+        writer.add_scalar('mIoU/Train', train_iou, epoch)
+        writer.add_scalar('mIoU/Val', val_iou, epoch)
         
         # 更新学习率
-        scheduler.step()
+        if args.scheduler == 'plateau':
+            scheduler.step(val_iou)  # 传递验证IoU给ReduceLROnPlateau
+        else:
+            scheduler.step()  # StepLR和CosineAnnealingLR不需要参数
         
         # 保存最佳模型
         if val_iou > best_iou:
@@ -315,6 +438,9 @@ def main():
         print(f"  Best Val IoU: {best_iou:.4f}")
         print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         print()
+    
+    # 关闭TensorBoard writer
+    writer.close()
     
     print("\nTraining completed!")
     print(f"Best validation IoU: {best_iou:.4f}")
