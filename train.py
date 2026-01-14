@@ -57,13 +57,17 @@ def calculate_miou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int)
             intersection[cls] = cls_intersection
             union[cls] = cls_union
     
-    # 计算非零类别的IoU
-    valid_classes = (union > 0).sum()
-    if valid_classes == 0:
-        return 0.0
+    # 计算所有前景类别的IoU，未出现的类别IoU视为0
+    foreground_classes = range(1, num_classes)  # 1到num_classes-1，不包括背景
     
-    iou_per_class = intersection[union > 0] / union[union > 0]
-    mIoU = iou_per_class.mean().item()
+    iou_per_class = []
+    for cls in foreground_classes:
+        if union[cls] > 0:
+            iou_per_class.append(intersection[cls] / union[cls])
+        else:
+            iou_per_class.append(torch.tensor(0.0, device=preds.device))
+    
+    mIoU = torch.stack(iou_per_class).mean().item()
     
     return mIoU
 
@@ -94,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use')
     parser.add_argument('--freeze-backbone', action='store_true', help='Freeze backbone and only train classifier')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--val-size', type=str, default='all', help='Validation set size (use "all" for full dataset, or an integer for sample size)')
     return parser.parse_args()
 
 # 主训练函数
@@ -158,9 +163,20 @@ def main() -> None:
         transform=val_transform
     )
     
-    # 随机采样1000张验证集（固定seed确保可复现）
-    val_indices = np.random.choice(len(val_dataset), 1000, replace=False)
-    val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+    # 根据参数决定使用全量验证集还是样本集
+    if args.val_size.lower() != 'all':
+        try:
+            val_size = int(args.val_size)
+            if val_size > 0 and val_size < len(val_dataset):
+                val_indices = np.random.choice(len(val_dataset), val_size, replace=False)
+                val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+                print(f"使用{val_size}张验证集样本")
+            else:
+                print(f"验证集样本数{val_size}无效，使用全量验证集")
+        except ValueError:
+            print(f"验证集样本数参数{args.val_size}无效，使用全量验证集")
+    else:
+        print("使用全量验证集")
     
     # 自定义collate_fn，跳过错误图像
     def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor]:
