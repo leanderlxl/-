@@ -341,7 +341,7 @@ class COCO_SemanticSegDataset(Dataset):
                 self.class_to_cat_id = {int(k): int(v) for k, v in cat_map['cont_to_cat_id'].items()}
         else:
             # 如果没有提供cat_map.json路径，则手动构建映射
-            # map original COCO category_id (sparse, non-contiguous) to continuous class indices
+            # #map original COCO category_id (sparse, non-contiguous) to continuous class indices
             # reserve 0 for background
             self.cat_id_to_class = {cat['id']: idx + 1 for idx, cat in enumerate(self.annotations['categories'])}
             self.class_to_cat_id = {idx + 1: cat['id'] for idx, cat in enumerate(self.annotations['categories'])}
