@@ -352,12 +352,19 @@ def main() -> None:
                 with torch.no_grad():
                     predicted = out.argmax(dim=1)
                     
+                    # 确保predicted值在有效范围内
+                    pred_min = predicted.min().item()
+                    pred_max = predicted.max().item()
+                    
+                    if pred_max >= num_classes:
+                        print(f"Warning: Predicted contains values >= num_classes ({num_classes}). Clipping to valid range...")
+                        predicted = torch.clamp(predicted, 0, num_classes - 1)
+                        pred_max = num_classes - 1
+                    
                     # Debug: Check mask values before calling torchmetrics
                     mask_min = masks.min().item()
                     mask_max = masks.max().item()
                     mask_unique = torch.unique(masks).tolist()
-                    pred_min = predicted.min().item()
-                    pred_max = predicted.max().item()
                     pred_unique = torch.unique(predicted).tolist()
                     
                     print(f"\nDebug - Batch {train_batches}:")
@@ -366,10 +373,17 @@ def main() -> None:
                     print(f"  Masks shape: {masks.shape}, min: {mask_min}, max: {mask_max}")
                     print(f"  Masks unique values (first 20): {mask_unique[:20]}")
                     
+                    # 处理crowd像素（值为255），将其转换为ignore_index=0
+                    masks_processed = masks.clone()
+                    masks_processed[masks_processed == 255] = 0  # 将crowd像素转换为背景
+                    
+                    # 确保masks_processed的值只在0-80范围内
+                    masks_processed = torch.clamp(masks_processed, 0, 80)
+                    
                     if use_torchmetrics and train_iou_metric is not None:
-                        train_iou_metric(predicted, masks)
+                        train_iou_metric(predicted, masks_processed)
                     else:
-                        update_miou_metrics(predicted, masks, num_classes, train_intersection, train_union)
+                        update_miou_metrics(predicted, masks_processed, num_classes, train_intersection, train_union)
                 
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}'
@@ -424,10 +438,22 @@ def main() -> None:
                     
                     # 计算并累积IoU指标
                     predicted = out.argmax(dim=1)
+                    
+                    # 确保predicted值在有效范围内
+                    if predicted.max() >= num_classes:
+                        predicted = torch.clamp(predicted, 0, num_classes - 1)
+                    
+                    # 处理crowd像素（值为255），将其转换为ignore_index=0
+                    masks_processed = masks.clone()
+                    masks_processed[masks_processed == 255] = 0  # 将crowd像素转换为背景
+                    
+                    # 确保masks_processed的值只在0-80范围内
+                    masks_processed = torch.clamp(masks_processed, 0, 80)
+                    
                     if use_torchmetrics and val_iou_metric is not None:
-                        val_iou_metric(predicted, masks)
+                        val_iou_metric(predicted, masks_processed)
                     else:
-                        update_miou_metrics(predicted, masks, num_classes, val_intersection, val_union)
+                        update_miou_metrics(predicted, masks_processed, num_classes, val_intersection, val_union)
                     
                     # 可视化预测结果，每隔2个epoch记录一次
                     # 这里val_batches已经递增，但我们检查val_batches == 1表示第一个批次

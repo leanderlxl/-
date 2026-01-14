@@ -240,9 +240,30 @@ class COCOSegDataset(Dataset):
                         
                         # 确保掩码是numpy数组或PIL Image，然后转换为torch.long
                         if isinstance(mask_result, torch.Tensor):
-                            mask_tensor = mask_result.long()
+                            # 验证mask值
+                            mask_np = mask_result.cpu().numpy()
+                            unique_values = np.unique(mask_np)
+                            valid_values = set(range(81)) | {255}
+                            invalid_values = [val for val in unique_values if val not in valid_values]
+                            
+                            if invalid_values:
+                                print(f"Warning: Transform result - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+                                mask_np = np.clip(mask_np, 0, 80)
+                                mask_tensor = torch.as_tensor(mask_np, dtype=torch.long).to(mask_result.device)
+                            else:
+                                mask_tensor = mask_result.long()
                         else:
                             mask_np = np.array(mask_result, dtype=np.int64)
+                            
+                            # 验证mask值
+                            unique_values = np.unique(mask_np)
+                            valid_values = set(range(81)) | {255}
+                            invalid_values = [val for val in unique_values if val not in valid_values]
+                            
+                            if invalid_values:
+                                print(f"Warning: Transform result (non-tensor) - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+                                mask_np = np.clip(mask_np, 0, 80)
+                            
                             mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
                     else:
                         print(f"Warning: Transform should return a tuple of (image, mask), got {type(transformed)}")
