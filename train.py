@@ -357,22 +357,10 @@ def main() -> None:
                     pred_max = predicted.max().item()
                     
                     if pred_max >= num_classes:
-                        print(f"Warning: Predicted contains values >= num_classes ({num_classes}). Clipping to valid range...")
                         predicted = torch.clamp(predicted, 0, num_classes - 1)
                         pred_max = num_classes - 1
                     
-                    # Debug: Check mask values before calling torchmetrics
-                    mask_min = masks.min().item()
-                    mask_max = masks.max().item()
-                    mask_unique = torch.unique(masks).tolist()
-                    pred_unique = torch.unique(predicted).tolist()
-                    
-                    print(f"\nDebug - Batch {train_batches}:")
-                    print(f"  Predicted shape: {predicted.shape}, min: {pred_min}, max: {pred_max}")
-                    print(f"  Predicted unique values (first 20): {pred_unique[:20]}")
-                    print(f"  Masks shape: {masks.shape}, min: {mask_min}, max: {mask_max}")
-                    print(f"  Masks unique values (first 20): {mask_unique[:20]}")
-                    
+
                     # 处理crowd像素（值为255），将其转换为ignore_index=0
                     masks_processed = masks.clone()
                     masks_processed[masks_processed == 255] = 0  # 将crowd像素转换为背景
@@ -439,9 +427,7 @@ def main() -> None:
                     # 计算并累积IoU指标
                     predicted = out.argmax(dim=1)
                     
-                    # 确保predicted值在有效范围内
-                    if predicted.max() >= num_classes:
-                        predicted = torch.clamp(predicted, 0, num_classes - 1)
+
                     
                     # 处理crowd像素（值为255），将其转换为ignore_index=0
                     masks_processed = masks.clone()

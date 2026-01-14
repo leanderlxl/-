@@ -13,7 +13,7 @@ try:
     from pycocotools.coco import COCO
     from pycocotools import mask as maskUtils
 except Exception:
-    print("pycocotools not found. Please install it with 'pip install pycocotools'")
+
     raise
 
 
@@ -95,7 +95,6 @@ class SemanticSegTransform:
         invalid_values = [val for val in unique_values if val not in valid_values]
         
         if invalid_values:
-            print(f"Warning: Mask contains invalid values: {invalid_values}. Clipping to valid range...")
             # 将无效值裁剪到有效范围
             mask = np.clip(mask, 0, 80)
         
@@ -161,7 +160,7 @@ class COCOSegDataset(Dataset):
             
             # 检查图像是否存在
             if not os.path.exists(img_path):
-                print(f"Warning: Image not found: {img_path}")
+
                 return None
             
             # 读取原图
@@ -170,7 +169,7 @@ class COCOSegDataset(Dataset):
             
             # 验证图像尺寸是否与注释一致
             if image.height != h or image.width != w:
-                print(f"Warning: Image size mismatch for image {img_id}: expected {w}x{h}, got {image.width}x{image.height}")
+
                 return None
             
             # 创建空的语义分割掩码（背景=0）
@@ -199,7 +198,7 @@ class COCOSegDataset(Dataset):
                             cont_id = self.cat_id_to_cont_id[cat_id]
                             # 确保类别ID在有效范围内 (0~80)
                             if cont_id > 80:
-                                print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
+
                                 cont_id = min(cont_id, 80)
                             # 使用COCO API获取二值掩码
                             binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
@@ -211,7 +210,7 @@ class COCOSegDataset(Dataset):
                             # 按连续类别ID填充掩码
                             seg_mask[binary_mask == 1] = cont_id
                 except Exception as e:
-                    print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
+
                     continue
             
             # 转换为PIL Image以便应用transform
@@ -247,7 +246,7 @@ class COCOSegDataset(Dataset):
                             invalid_values = [val for val in unique_values if val not in valid_values]
                             
                             if invalid_values:
-                                print(f"Warning: Transform result - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+
                                 mask_np = np.clip(mask_np, 0, 80)
                                 mask_tensor = torch.as_tensor(mask_np, dtype=torch.long).to(mask_result.device)
                             else:
@@ -261,15 +260,15 @@ class COCOSegDataset(Dataset):
                             invalid_values = [val for val in unique_values if val not in valid_values]
                             
                             if invalid_values:
-                                print(f"Warning: Transform result (non-tensor) - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+
                                 mask_np = np.clip(mask_np, 0, 80)
                             
                             mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
                     else:
-                        print(f"Warning: Transform should return a tuple of (image, mask), got {type(transformed)}")
+
                         return None
                 except Exception as e:
-                    print(f"Error applying transform to image {img_id}: {e}")
+
                     # 应用默认变换
                     image_tensor = transforms.ToTensor()(image)
                     image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
