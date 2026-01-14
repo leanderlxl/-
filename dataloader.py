@@ -88,6 +88,17 @@ class SemanticSegTransform:
         
         # 将mask转换为LongTensor，确保dtype和尺寸正确
         mask = np.array(mask, dtype=np.int64)
+        
+        # 严格验证mask中的值，确保只包含[0,80]和255
+        unique_values = np.unique(mask)
+        valid_values = set(range(81)) | {255}
+        invalid_values = [val for val in unique_values if val not in valid_values]
+        
+        if invalid_values:
+            print(f"Warning: Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+            # 将无效值裁剪到有效范围
+            mask = np.clip(mask, 0, 80)
+        
         mask = torch.as_tensor(mask, dtype=torch.long)
         
         return image, mask
@@ -241,12 +252,34 @@ class COCOSegDataset(Dataset):
                     # 应用默认变换
                     image_tensor = transforms.ToTensor()(image)
                     image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
-                    mask_tensor = torch.as_tensor(seg_mask, dtype=torch.long)
+                    
+                    # 验证并转换mask
+                    mask_np = np.array(seg_mask, dtype=np.int64)
+                    unique_values = np.unique(mask_np)
+                    valid_values = set(range(81)) | {255}
+                    invalid_values = [val for val in unique_values if val not in valid_values]
+                    
+                    if invalid_values:
+                        print(f"Warning: Exception handler - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+                        mask_np = np.clip(mask_np, 0, 80)
+                    
+                    mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
             else:
                 # 应用默认变换
                 image_tensor = transforms.ToTensor()(image)
                 image_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(image_tensor)
-                mask_tensor = torch.as_tensor(seg_mask, dtype=torch.long)
+                
+                # 验证并转换mask
+                mask_np = np.array(seg_mask, dtype=np.int64)
+                unique_values = np.unique(mask_np)
+                valid_values = set(range(81)) | {255}
+                invalid_values = [val for val in unique_values if val not in valid_values]
+                
+                if invalid_values:
+                    print(f"Warning: Default transform - Mask contains invalid values: {invalid_values}. Clipping to valid range...")
+                    mask_np = np.clip(mask_np, 0, 80)
+                
+                mask_tensor = torch.as_tensor(mask_np, dtype=torch.long)
             
             # 确保掩码是2D张量（HxW）
             if len(mask_tensor.shape) > 2:
