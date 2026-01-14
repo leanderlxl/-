@@ -8,6 +8,7 @@ python train.py \
   --lr 1e-3 \
   --device cuda\
   --val-size 1000
+  
 明天早上起来再继续训练5轮
 早上起来先拉取代码，然后尽量不要停止训练，因为下午不好抢
 显卡

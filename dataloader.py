@@ -86,6 +86,10 @@ class SemanticSegTransform:
         # 对图像进行归一化
         image = transforms.Normalize(mean=self.normalize['mean'], std=self.normalize['std'])(image)
         
+        # 将mask转换为LongTensor，确保dtype和尺寸正确
+        mask = np.array(mask, dtype=np.int64)
+        mask = torch.as_tensor(mask, dtype=torch.long)
+        
         return image, mask
 
 
@@ -168,22 +172,33 @@ class COCOSegDataset(Dataset):
             # 遍历所有注释，生成掩码
             for ann in anns:
                 try:
-                    cat_id = ann['category_id']
-                    if cat_id in self.cat_id_to_cont_id:
-                        cont_id = self.cat_id_to_cont_id[cat_id]
-                        # 确保类别ID在有效范围内 (0~80)
-                        if cont_id > 80:
-                            print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
-                            cont_id = min(cont_id, 80)
-                        # 使用COCO API获取二值掩码
-                        binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
-                        
-                        # 验证掩码尺寸是否与图像一致
+                    # 检查是否为crowd区域，如果是则设置为ignore_index=255
+                    iscrowd = ann.get('iscrowd', 0)
+                    
+                    if iscrowd == 1:
+                        # crowd区域设置为ignore_index
+                        binary_mask = self.coco.annToMask(ann)
                         if binary_mask.shape != (h, w):
                             binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # 按连续类别ID填充掩码
-                        seg_mask[binary_mask == 1] = cont_id
+                        seg_mask[binary_mask == 1] = 255  # ignore_index
+                    else:
+                        # 正常注释
+                        cat_id = ann['category_id']
+                        if cat_id in self.cat_id_to_cont_id:
+                            cont_id = self.cat_id_to_cont_id[cat_id]
+                            # 确保类别ID在有效范围内 (0~80)
+                            if cont_id > 80:
+                                print(f"Warning: Category ID {cont_id} exceeds maximum allowed (80) for image {img_id}")
+                                cont_id = min(cont_id, 80)
+                            # 使用COCO API获取二值掩码
+                            binary_mask = self.coco.annToMask(ann)  # 返回 HxW 的二值掩码（0/1）
+                            
+                            # 验证掩码尺寸是否与图像一致
+                            if binary_mask.shape != (h, w):
+                                binary_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                            
+                            # 按连续类别ID填充掩码
+                            seg_mask[binary_mask == 1] = cont_id
                 except Exception as e:
                     print(f"Warning: Error processing annotation {ann['id']} for image {img_id}: {e}")
                     continue
@@ -338,13 +353,23 @@ class COCO_SemanticSegDataset(Dataset):
                 if ann['image_id'] == img_id:
                     if 'segmentation' not in ann:
                         continue
-                    category_id = ann.get('category_id', None)
-                    if category_id is None:
-                        continue
-                    class_id = self.cat_id_to_class.get(category_id, 0)
+                    
+                    # 检查是否为crowd区域
+                    iscrowd = ann.get('iscrowd', 0)
+                    
+                    if iscrowd == 1:
+                        # crowd区域设置为ignore_index
+                        class_id = 255  # ignore_index
+                    else:
+                        # 正常注释
+                        category_id = ann.get('category_id', None)
+                        if category_id is None:
+                            continue
+                        class_id = self.cat_id_to_class.get(category_id, 0)
                     
                     # 确保类别ID在有效范围内 (0~80)
-                    if class_id > 80:
+                    # 但保留ignore_index=255
+                    if class_id != 255 and class_id > 80:
                         print(f"Warning: Category ID {class_id} exceeds maximum allowed (80) for image {img_id}")
                         class_id = min(class_id, 80)
 

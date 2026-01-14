@@ -24,39 +24,47 @@ except ImportError:
     print("Warning: torchmetrics not found, using manual mIoU calculation")
 
 # 手动计算mIoU的函数
-def calculate_miou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> float:
+def update_miou_metrics(preds: torch.Tensor, targets: torch.Tensor, num_classes: int, 
+                        intersection: torch.Tensor, union: torch.Tensor, ignore_label: int = 255) -> None:
     """
-    计算多类IoU的平均值
+    更新多类IoU计算的累积交集和并集
     
     Args:
         preds: 预测结果，形状为[B, H, W]的long张量
         targets: 真实标签，形状为[B, H, W]的long张量
         num_classes: 类别数量
-        
-    Returns:
-        mIoU: 平均IoU值
+        intersection: 累积交集张量，形状为[num_classes]
+        union: 累积并集张量，形状为[num_classes]
+        ignore_label: 要忽略的标签值
     """
-    # 计算每个类别和批次的交集和并集    
-    intersection = torch.zeros(num_classes, device=preds.device)
-    union = torch.zeros(num_classes, device=preds.device)
+    # 过滤掉ignore标签的像素
+    valid_mask = (targets != ignore_label)
+    preds_valid = preds[valid_mask]
+    targets_valid = targets[valid_mask]
     
-    for cls in range(num_classes):
-        # 忽略背景类0
-        if cls == 0:
-            continue
-            
-        # 计算当前类别的交集和并集
-        pred_cls = (preds == cls)
-        target_cls = (targets == cls)
+    for cls in range(1, num_classes):  # 忽略背景类0
+        pred_cls = (preds_valid == cls)
+        target_cls = (targets_valid == cls)
         
         cls_intersection = (pred_cls & target_cls).sum()
         cls_union = (pred_cls | target_cls).sum()
         
-        # 避免除以零
-        if cls_union > 0:
-            intersection[cls] = cls_intersection
-            union[cls] = cls_union
+        intersection[cls] += cls_intersection
+        union[cls] += cls_union
+
+
+def calculate_miou_from_metrics(intersection: torch.Tensor, union: torch.Tensor, num_classes: int) -> float:
+    """
+    从累积的交集和并集计算最终的mIoU
     
+    Args:
+        intersection: 累积交集张量，形状为[num_classes]
+        union: 累积并集张量，形状为[num_classes]
+        num_classes: 类别数量
+        
+    Returns:
+        mIoU: 平均IoU值
+    """
     # 计算所有前景类别的IoU，未出现的类别IoU视为0
     foreground_classes = range(1, num_classes)  # 1到num_classes-1，不包括背景
     
@@ -65,7 +73,7 @@ def calculate_miou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int)
         if union[cls] > 0:
             iou_per_class.append(intersection[cls] / union[cls])
         else:
-            iou_per_class.append(torch.tensor(0.0, device=preds.device))
+            iou_per_class.append(torch.tensor(0.0, device=intersection.device))
     
     mIoU = torch.stack(iou_per_class).mean().item()
     
@@ -90,10 +98,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--epochs', type=int, default=25, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
-    parser.add_argument('--scheduler', type=str, default='steplr', choices=['steplr', 'cosine', 'plateau'], help='Scheduler type')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['steplr', 'cosine', 'plateau'], help='Scheduler type')
     parser.add_argument('--step-size', type=int, default=7, help='Step size for StepLR scheduler')
-    parser.add_argument('--gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
-    parser.add_argument('--resize-size', type=tuple, default=(256, 256), help='Resize size for images and masks')
+    parser.add_argument('--gamma', type=float, default=0.5, help='Gamma for StepLR scheduler')
+    parser.add_argument('--resize-size', type=tuple, default=(512, 512), help='Resize size for images and masks')
     parser.add_argument('--flip-prob', type=float, default=0.5, help='Probability of horizontal flip')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use')
     parser.add_argument('--freeze-backbone', action='store_true', help='Freeze backbone and only train classifier')
@@ -115,8 +123,11 @@ def main() -> None:
     # 1. 设置模型
     print("\n1. Setting up model...")
     # 加载预训练的 DeepLabv3+ResNet50 模型
+    # 使用weights_backbone参数只加载ImageNet backbone预训练权重
+    # segmentation head不加载预训练权重（随机初始化）
     model = torchvision.models.segmentation.deeplabv3_resnet50(
-        weights=torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
+        weights=None,  # 不加载完整模型权重
+        weights_backbone=torchvision.models.ResNet50_Weights.IMAGENET1K_V1  # 只加载backbone的ImageNet权重
     )
     
     # 替换分类头为 81 类（包括背景）
@@ -143,10 +154,12 @@ def main() -> None:
         flip_prob=args.flip_prob
     )
     
-    # 验证集变换（不需要翻转）
+    # 验证集变换（不需要任何随机行为）
     val_transform = SemanticSegTransform(
         resize_size=args.resize_size,
-        flip_prob=0.0
+        flip_prob=0.0,
+        crop_prob=0.0,  # 禁用随机裁剪
+        color_jitter=None  # 禁用颜色增强
     )
     
     # 加载训练数据集
@@ -226,11 +239,13 @@ def main() -> None:
     
     # 3. 设置损失函数和优化器
     print("\n3. Setting up loss function and optimizer...")
-    criterion = nn.CrossEntropyLoss()
+    # 使用CrossEntropyLoss并设置ignore_index来忽略无效像素（255）
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
     
     # 只优化需要梯度的参数
     params_to_optimize = [param for param in model.parameters() if param.requires_grad]
-    optimizer = optim.Adam(
+    # 使用AdamW优化器，在语义分割+weight_decay场景下比Adam更稳定
+    optimizer = optim.AdamW(
         params_to_optimize,
         lr=args.lr,
         weight_decay=args.weight_decay
@@ -253,47 +268,39 @@ def main() -> None:
             optimizer,
             mode='max',  # 最大化mIoU
             factor=args.gamma,
-            patience=3,
+            patience=5,
             verbose=True
         )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
     
-    # 4. 加载checkpoint（如果存在）
-    print("\n4. Checking for checkpoint...")
+    # 4. 初始化训练状态（不加载旧checkpoint，从epoch 0开始）
+    print("\n4. Initializing training state...")
     start_epoch = 0
     best_iou = 0.0
     checkpoint_path = './checkpoints/best_model.pth'
     
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=args.device)
-        
-        # 加载模型状态
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # 加载优化器状态
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        # 加载调度器状态
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        # 加载训练统计信息
-        start_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
-        best_iou = checkpoint['best_iou']
-        
-        print(f"Checkpoint loaded successfully.")
-        print(f"  Starting from epoch: {start_epoch}")
-        print(f"  Best IoU so far: {best_iou:.4f}")
-    else:
-        print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+    # 根据改进指南，我们从epoch 0开始重新训练，不加载旧模型
+    print("Starting fresh training from epoch 0")
+    print("(Note: Not loading any previous checkpoint as per the improvement guidelines)")
     
     # 5. 设置评估指标 (mIoU)
     print("\n5. Setting up evaluation metrics...")
-    iou_metric = None
+    # 训练和验证分别使用独立的IoU指标实例，避免互相污染
+    # 注意：ignore_index=0 表示忽略背景类，与手写IoU的逻辑保持一致（只计算前景类）
+    train_iou_metric = None
+    val_iou_metric = None
     if use_torchmetrics:
-        iou_metric = MulticlassJaccardIndex(num_classes=num_classes, average='macro').to(args.device)
+        train_iou_metric = MulticlassJaccardIndex(
+            num_classes=num_classes, 
+            average='macro',
+            ignore_index=0  # 忽略背景类
+        ).to(args.device)
+        val_iou_metric = MulticlassJaccardIndex(
+            num_classes=num_classes, 
+            average='macro',
+            ignore_index=0  # 忽略背景类
+        ).to(args.device)
     
     # 6. 初始化TensorBoard
     print("\n6. Setting up TensorBoard...")
@@ -310,8 +317,11 @@ def main() -> None:
         # 训练阶段
         model.train()
         train_loss = 0.0
-        train_iou = 0.0
         train_batches = 0
+        
+        # 初始化累积交集和并集
+        train_intersection = torch.zeros(num_classes, device=args.device)
+        train_union = torch.zeros(num_classes, device=args.device)
         
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Training") as pbar:
             for images, masks in pbar:
@@ -326,7 +336,7 @@ def main() -> None:
                 outputs = model(images)
                 out = outputs['out']
                 
-                # 计算损失
+                # 计算损失，忽略背景类0
                 loss = criterion(out, masks)
                 
                 # 梯度更新
@@ -334,31 +344,30 @@ def main() -> None:
                 loss.backward()
                 optimizer.step()
                 
-                # 计算 IoU
-                with torch.no_grad():
-                    predicted = out.argmax(dim=1)
-                    if use_torchmetrics and iou_metric is not None:
-                        batch_iou = iou_metric(predicted, masks)
-                    else:
-                        batch_iou = calculate_miou(predicted, masks, num_classes)
-                    
-                # 更新统计信息（使用batch平均）
+                # 更新统计信息
                 train_loss += loss.item()
-                train_iou += batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
                 train_batches += 1
                 
-                # 格式化IoU值，根据类型决定是否调用.item()
-                iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
+                # 计算并累积IoU指标
+                with torch.no_grad():
+                    predicted = out.argmax(dim=1)
+                    if use_torchmetrics and train_iou_metric is not None:
+                        train_iou_metric(predicted, masks)
+                    else:
+                        update_miou_metrics(predicted, masks, num_classes, train_intersection, train_union)
                 
                 pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'iou': f'{iou_value:.4f}'
+                    'loss': f'{loss.item():.4f}'
                 })
         
         # 计算 epoch 训练指标
         if train_batches > 0:
             train_loss /= train_batches
-            train_iou /= train_batches
+            if use_torchmetrics and train_iou_metric is not None:
+                train_iou = train_iou_metric.compute().item()
+                train_iou_metric.reset()
+            else:
+                train_iou = calculate_miou_from_metrics(train_intersection, train_union, num_classes)
         else:
             train_loss = 0.0
             train_iou = 0.0
@@ -366,8 +375,11 @@ def main() -> None:
         # 验证阶段
         model.eval()
         val_loss = 0.0
-        val_iou = 0.0
         val_batches = 0
+        
+        # 初始化累积交集和并集
+        val_intersection = torch.zeros(num_classes, device=args.device)
+        val_union = torch.zeros(num_classes, device=args.device)
         
         with torch.no_grad():
             with tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} - Validation") as pbar:
@@ -386,15 +398,25 @@ def main() -> None:
                     # 计算损失
                     loss = criterion(out, masks)
                     
-                    # 计算 IoU
+                    # 保存当前批次的统计信息用于可视化
+                    current_batch_loss = loss.item()
+                    current_batch_images = images
+                    current_batch_masks = masks
+                    
+                    # 更新统计信息
+                    val_loss += current_batch_loss
+                    val_batches += 1
+                    
+                    # 计算并累积IoU指标
                     predicted = out.argmax(dim=1)
-                    if use_torchmetrics and iou_metric is not None:
-                        batch_iou = iou_metric(predicted, masks)
+                    if use_torchmetrics and val_iou_metric is not None:
+                        val_iou_metric(predicted, masks)
                     else:
-                        batch_iou = calculate_miou(predicted, masks, num_classes)
+                        update_miou_metrics(predicted, masks, num_classes, val_intersection, val_union)
                     
                     # 可视化预测结果，每隔2个epoch记录一次
-                    if val_batches == 0 and (epoch % 2 == 0):  # 每个epoch的第一个batch，每隔2个epoch记录一次
+                    # 这里val_batches已经递增，但我们检查val_batches == 1表示第一个批次
+                    if val_batches == 1 and (epoch % 2 == 0):  # 每个epoch的第一个batch，每隔2个epoch记录一次
                         # 选择第一张图片进行可视化
                         
                         # 恢复图像的原始颜色
@@ -403,10 +425,10 @@ def main() -> None:
                             transforms.Normalize(mean=[-0.485, -0.456, -0.406], std=[1., 1., 1.])
                         ])
                         
-                        img = inv_normalize(images[0]).cpu().numpy().transpose(1, 2, 0)
+                        img = inv_normalize(current_batch_images[0]).cpu().numpy().transpose(1, 2, 0)
                         img = np.clip(img, 0, 1)
                         
-                        mask = masks[0].cpu().numpy()
+                        mask = current_batch_masks[0].cpu().numpy()
                         pred = predicted[0].cpu().numpy()
                         
                         # 创建可视化图像
@@ -429,25 +451,19 @@ def main() -> None:
                         writer.add_figure('Val/Prediction_Example', fig, epoch)
                         plt.close(fig)  # 显式关闭figure，释放内存
                     
-                    # 递增batch计数
-                    val_batches += 1
-                    
-                    # 更新统计信息（使用batch平均）
-                    val_loss += loss.item()
-                    val_iou += batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
-                    
-                    # 格式化IoU值，根据类型决定是否调用.item()
-                    iou_value = batch_iou.item() if isinstance(batch_iou, torch.Tensor) else batch_iou
-                    
+                    # 设置进度条显示
                     pbar.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'iou': f'{iou_value:.4f}'
+                        'loss': f'{loss.item():.4f}'
                     })
         
         # 计算 epoch 验证指标
         if val_batches > 0:
             val_loss /= val_batches
-            val_iou /= val_batches
+            if use_torchmetrics and val_iou_metric is not None:
+                val_iou = val_iou_metric.compute().item()
+                val_iou_metric.reset()
+            else:
+                val_iou = calculate_miou_from_metrics(val_intersection, val_union, num_classes)
         else: 
             val_loss = 0.0
             val_iou = 0.0
